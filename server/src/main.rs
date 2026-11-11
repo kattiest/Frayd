@@ -143,45 +143,7 @@ async fn main() {
         run_scan(state.clone(), ScanRequest { roots: library.roots, for_ingest: false });
     }
 
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/build", get(build_info::handler))
-        .route("/api/media/{id}", axum::routing::delete(delete_media))
-        .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
-        .route("/api/library", get(library_handler))
-        .route("/api/stream/{id}", get(stream))
-        .route("/api/progress", post(set_progress))
-        .route("/api/progress/{media_id}", get(get_progress))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/password", post(auth_change_password))
-        .route("/api/setup", get(setup_status).post(auth_setup))
-        .route("/api/admin/perms", get(list_perms).post(set_perm))
-        .route("/api/admin/settings", get(get_settings).post(set_setting))
-        .route("/api/thumb/{id}", get(thumb))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/ingest", post(ingest))
-        .route("/api/scan/status", get(scan_status))
-        .route("/api/party", post(party_create))
-        .route("/api/party/{code}/ws", get(party_ws))
-        .route("/api/comic/{id}/pages", get(comic_pages))
-        .route("/api/comic/{id}/page/{n}", get(comic_page))
-        .route("/api/epub/{id}/spine", get(epub_spine))
-        .route("/api/epub/{id}/toc", get(epub_toc))
-        .route("/api/epub/{id}/chunk/{n}", get(epub_chunk))
-        .route("/api/epub/{id}/asset/*path", get(epub_asset))
-        .route("/api/annotations/{id}", get(list_annotations))
-        .route("/api/annotations", post(create_annotation))
-        .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(client_dir()))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
-        )
-        .with_state(state.clone());
+    let app = app_router(state.clone(), client_dir());
 
     // Port: FRAYD_PORT env > settings.port > 8484
     let port: u16 = std::env::var("FRAYD_PORT")
@@ -256,6 +218,7 @@ async fn main() {
 fn app_router(state: Arc<App>, client: PathBuf) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/build", get(build_info::handler))
         .route("/api/media/{id}", axum::routing::delete(delete_media))
         .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))
