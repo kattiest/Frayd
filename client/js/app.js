@@ -867,6 +867,35 @@ function artwork(item, portrait = false, memberOnly = false) {
 const categoryLabels = { movie: 'Movies', episode: 'TV Shows', music: 'Music', audiobook: 'Audiobooks', ebook: 'Ebooks', comic: 'Comics', manga: 'Manga' };
 
 /** One current-state sort control per canonical category; member extremes order folders. */
+/** Incremental card painter: renders pages of items, loads the next page when the
+    sentinel nears the viewport. Grouping logic stays unchanged — only rendering is paged. */
+const LAZY_PAGE = 33;
+function lazyGrid(gridClass = 'cards', entries, renderEntry) {
+  const grid = el('div', gridClass);
+  let shown = 0;
+  let sentinel = null;
+  const paintPage = () => {
+    const page = entries.slice(shown, shown + LAZY_PAGE);
+    page.forEach(entry => grid.appendChild(renderEntry(entry)));
+    shown += page.length;
+    if (shown >= entries.length) {
+      if (sentinel) sentinel.remove();
+      sentinel = null;
+      return;
+    }
+    if (!sentinel) {
+      sentinel = el('div', 'lazy-sentinel');
+      sentinel.style.height = '1px';
+      grid.after(sentinel);
+      new IntersectionObserver((observes, observer) => {
+        if (observes[0].isIntersecting) { observer.disconnect(); paintPage(); }
+      }, { root: null, rootMargin: '600px' }).observe(sentinel);
+    }
+  };
+  paintPage();
+  return grid;
+}
+
 function categoryShelf(kind, entries, renderEntry, gridClass = 'cards') {
   const wrap = el('section');
   const head = el('div', 'row-head', `<h3>Recently Added ${categoryLabels[kind]}</h3>`);
@@ -885,13 +914,27 @@ function categoryShelf(kind, entries, renderEntry, gridClass = 'cards') {
     const ordered = [...entries].sort((a, b) => (oldest ? 1 : -1) * (date(a) - date(b))
       || (a.name === undefined ? a.id - b.id : a.name.localeCompare(b.name)));
     grid.innerHTML = '';
-    ordered.forEach(entry => grid.appendChild(renderEntry(entry)));
+    // Replace the paint body's renderer so sort toggles repaint incrementally too.
+    lazyPaint(grid, ordered, renderEntry);
   };
   button.onclick = () => { rowSort.set(kind, !rowSort.get(kind)); paint(); };
   head.appendChild(button);
   paint();
   wrap.append(head, grid);
   return wrap;
+}
+
+/** Paint `ordered` into `grid` page by page: first page synchronously, remaining
+    pages a frame apart so the shelf appears immediately on big libraries. */
+function lazyPaint(grid, ordered, renderEntry) {
+  let shown = 0;
+  const paintPage = () => {
+    const page = ordered.slice(shown, shown + LAZY_PAGE);
+    page.forEach(entry => grid.appendChild(renderEntry(entry)));
+    shown += page.length;
+    if (shown < ordered.length) requestAnimationFrame(paintPage);
+  };
+  paintPage();
 }
 
 /** Flat categories share the same heading, ordering and render-owned progress reader. */
@@ -1078,9 +1121,8 @@ function groupedByAuthor(kind, items, progressFor) {
     const up = el('button', 'link back-row', `← ${drill.author}`);
     up.onclick = () => { authorDrill[kind] = { author: drill.author }; return filterKind(kind); };
     wrap.append(up, el('div', 'row-head', `<h3>${esc(drill.series)}</h3>`));
-    const cards = el('div', 'cards');
-    authorItems.filter(item => item.series === drill.series).forEach(item => cards.appendChild(card(item, progressFor)));
-    wrap.appendChild(cards);
+    wrap.appendChild(lazyGrid('cards',
+      authorItems.filter(item => item.series === drill.series), item => card(item, progressFor)));
     return wrap;
   }
   wrap.appendChild(el('div', 'row-head', `<h3>${esc(drill.author)}</h3>`));
@@ -1101,9 +1143,7 @@ function groupedByAuthor(kind, items, progressFor) {
   const loose = authorItems.filter(item => !item.series);
   if (loose.length) {
     if (bySeries.size) wrap.appendChild(el('div', 'row-head series-head', '<h4>Other items</h4>'));
-    const cards = el('div', 'cards');
-    loose.forEach(item => cards.appendChild(card(item, progressFor)));
-    wrap.appendChild(cards);
+    wrap.appendChild(lazyGrid('cards', loose, item => card(item, progressFor)));
   }
   return wrap;
 }
