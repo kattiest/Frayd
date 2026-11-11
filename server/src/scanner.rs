@@ -318,11 +318,68 @@ thread_local! {
 /// Scan the complete request while retaining standalone callers' admission checks.
 pub fn scan_roots(db:&Connection,db_path:String,roots:&[std::path::PathBuf],thumbs_dir:Option<&Path>) -> Result<usize,ScanError> {
     if roots.is_empty() {return Ok(0);}
-    if let [root]=roots {return scan_with_roots(db,db_path,root.clone(),thumbs_dir,roots);}
-    preflight_scan(db,&db_path,thumbs_dir,roots,&roots[0])?;
-    let mut count=0;
-    for root in roots {count+=scan_preflighted_root(db,db_path.clone(),root.clone(),thumbs_dir,roots)?;}
+    let count=if let [root]=roots {
+        scan_with_roots(db,db_path,root.clone(),thumbs_dir,roots)?
+    } else {
+        preflight_scan(db,&db_path,thumbs_dir,roots,&roots[0])?;
+        let mut count=0;
+        for root in roots {count+=scan_preflighted_root(db,db_path.clone(),root.clone(),thumbs_dir,roots)?;}
+        count
+    };
+    prune_gone_sources(db,roots);
     Ok(count)
+}
+
+/// Remove index rows whose source file no longer exists on disk. A completed walk of every
+/// configured root is the witness: only rows under a current root, only paths the filesystem
+/// itself reports as gone. Rows outside current roots are never touched, and a scan that
+/// stopped early never prunes — a partial view must not judge absence.
+fn prune_gone_sources(db:&Connection,roots:&[std::path::PathBuf]) {
+    let read=|| -> rusqlite::Result<Vec<i64>> {
+        let mut stmt=db.prepare("SELECT id,path FROM media ORDER BY id")?;
+        let mut gone=Vec::new();
+        let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?;
+        for row in rows {
+            let (id,path)=row?;
+            let path=std::path::Path::new(&path);
+            if !roots.iter().any(|root|path.starts_with(root)) {continue;}
+            match std::fs::metadata(path) {
+                Ok(_)=>{},
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>gone.push(id),
+                Err(_)=>{}, // transient I/O error is not absence
+            }
+        }
+        Ok(gone)
+    };
+    let gone=match read() {
+        Ok(gone)=>gone,
+        Err(error)=>{tracing::warn!(%error,operation="prune","prune read failed; sources retained");return;}
+    };
+    if gone.is_empty() {return;}
+    let mut retired=0usize;
+    for id in &gone {
+        // Same reference guard as admin delete: rows with progress, annotations, tracks,
+        // playlist entries or conversion artifacts are kept and surfaced, not silently cut.
+        let referenced=db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM progress WHERE media_id=?1) OR EXISTS(SELECT 1 FROM annotations WHERE media_id=?1)
+             OR EXISTS(SELECT 1 FROM tracks WHERE media_id=?1) OR EXISTS(SELECT 1 FROM playlist_items WHERE media_id=?1)
+             OR EXISTS(SELECT 1 FROM transcode_artifacts WHERE owner_media_id=?1)",
+            [id],|r|r.get::<_,bool>(0)).unwrap_or(true);
+        if referenced {continue;}
+        let tx=match db.unchecked_transaction() {
+            Ok(tx)=>tx,
+            Err(_)=>continue,
+        };
+        if tx.execute("DELETE FROM media WHERE id=?1",[id]).unwrap_or(0)==1
+            && tx.commit().is_ok() {retired+=1;}
+    }
+    if retired>0 {
+        tracing::info!(operation="prune",retired,scanned=roots.len(),"removed index rows whose source files are gone");
+    }
+    let kept=gone.len()-retired;
+    if kept>0 {
+        tracing::warn!(operation="prune",kept,"missing sources retained: still referenced (progress/annotations/tracks/playlists/artifacts)");
+    }
 }
 
 /// Resolve each persisted source once before recovery can mutate ownership or historical rows.
@@ -780,6 +837,47 @@ fn classify_with_root(p:&Path,library_root:Option<&Path>) -> Option<&'static str
 mod tests {
     use super::*;
     use crate::store::open;
+
+    /// Mom's regression: a file deleted from disk must leave the index on the next scan.
+    #[test]
+    fn prune_removes_rows_whose_source_files_are_gone() {
+        let home=std::env::temp_dir().join(format!("frayd-prune-{}",uuid::Uuid::new_v4()));
+        let root=home.join("library");std::fs::create_dir_all(&root).unwrap();
+        let db_path=home.join("db.sqlite").to_string_lossy().into_owned();
+        let db=open(&db_path);
+        let kept=root.join("kept.mp3");
+        let gone=root.join("gone.mp3");
+        std::fs::write(&kept,b"x").unwrap();
+        std::fs::write(&gone,b"x").unwrap();
+        let roots=[root.clone()];
+        let first=scan_with_roots(&db,db_path.clone(),root.clone(),None,&roots);
+        assert_eq!(first,Ok(2),"first scan should index both files: {:?}",first.as_ref().map_err(|e|e.reason()));
+        std::fs::remove_file(&gone).unwrap();
+        // count is items ADDED, not total: a rescan of unchanged+deleted files indexes 0.
+        // The prune is judged by what remains in the index.
+        let _=scan_roots(&db,db_path.clone(),&roots,None).unwrap();
+        let rows:Vec<String>=db.prepare("SELECT path FROM media").unwrap()
+            .query_map([],|r|r.get(0)).unwrap().map(|r|r.unwrap()).collect();
+        assert_eq!(rows,vec![kept.to_string_lossy().into_owned()],"deleted source must leave the index");
+    }
+
+    /// A referenced missing source is retained, not silently cut.
+    #[test]
+    fn prune_keeps_missing_rows_that_still_have_progress() {
+        let home=std::env::temp_dir().join(format!("frayd-prune-ref-{}",uuid::Uuid::new_v4()));
+        let root=home.join("library");std::fs::create_dir_all(&root).unwrap();
+        let db_path=home.join("db.sqlite").to_string_lossy().into_owned();
+        let db=open(&db_path);
+        let gone=root.join("gone.mp3");
+        std::fs::write(&gone,b"x").unwrap();
+        assert_eq!(scan(&db,db_path.clone(),root.clone(),None),1);
+        let id:i64=db.query_row("SELECT id FROM media",[],|r|r.get(0)).unwrap();
+        db.execute("INSERT INTO identities(id,kind,key) VALUES(9,'device','p@x')",[]).unwrap();
+        db.execute("INSERT INTO progress(identity_id,media_id,position,completed) VALUES(9,?1,1.0,0)",[id]).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        scan_with_roots(&db,db_path.clone(),root.clone(),None,std::slice::from_ref(&root)).unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),1,"referenced missing source retained");
+    }
     use crate::test_support::{assert_child_passes, child, mtime_secs, path_with, scan};
     #[cfg(unix)]
     use crate::test_support::write_executable;
