@@ -590,7 +590,7 @@ fn upsert_item_with_roots(
         let unchanged=existing.as_ref().is_some_and(|(_,old_mtime,old_size)|
             *old_mtime==Some(mtime) && *old_size==Some(meta.len() as i64));
         let kind_only=unchanged && existing.as_ref().is_some_and(|(old_kind,_,_)|old_kind!=kind);
-        if kind_only || (unchanged && kind=="episode") {
+        if kind_only || (unchanged && (kind=="episode" || kind=="ebook")) {
             let changed=if kind_only {
                 let changed=tx.execute("UPDATE media SET kind=?1 WHERE path=?2 AND kind IS NOT ?1
                     AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![kind,path_str,mtime,meta.len() as i64])?;
@@ -603,6 +603,16 @@ fn upsert_item_with_roots(
                         AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![show,path_str,mtime,meta.len() as i64])?
                 } else {0}
             } else {0};
+            // Unchanged ebooks: refresh OPF metadata without a probe.
+            if kind=="ebook" {
+                let (epub_author,epub_title)=crate::epub::epub_metadata(path).unwrap_or((None,None));
+                if epub_author.is_some() || epub_title.is_some() {
+                    let n=tx.execute("UPDATE media SET author=COALESCE(?1,author), title=COALESCE(?2,title)
+                        WHERE path=?3",rusqlite::params![epub_author,epub_title,path_str])?;
+                    let refresh=ScanRefresh {updated:n,is_new:false,metadata_only:true,classification_only:false,prior_thumb:None};
+                    return Ok((refresh,None));
+                }
+            }
             let refresh=ScanRefresh {updated:changed.max(backfilled),is_new:false,metadata_only:true,classification_only:kind_only,prior_thumb:None};
             return Ok((refresh,None));
         }
@@ -654,12 +664,16 @@ fn upsert_item_with_roots(
         let ProbeMetadata { duration: dur, title: title_tag, synopsis, author: tag_author, series: tag_series } =
             ffprobe_metadata(&path_str).unwrap_or_default();
         // Episode tags win over show-name inference; audio retains its existing filename heuristics.
+        // Ebooks: OPF dc:creator/dc:title are authoritative; filename heuristics only fill gaps.
+        let (epub_author,epub_title)=if kind=="ebook" {
+            crate::epub::epub_metadata(path).unwrap_or((None,None))
+        } else {(None,None)};
         let (filename_author,filename_series)=filename_author_series(&title);
-        let author=tag_author.or(filename_author);
+        let author=epub_author.or(tag_author).or(filename_author);
         let series=tag_series.or_else(|| if kind=="episode" {episode_series(path,roots)}else{filename_series});
         let published = db.execute(
             "UPDATE media SET duration_secs = ?1,
-               title = CASE WHEN ?2 != '' THEN ?2 ELSE title END,
+               title = COALESCE(?7, CASE WHEN ?2 != '' THEN ?2 ELSE title END),
                author = COALESCE(?3, author),
                series = COALESCE(?4, series),
                meta_json = json_set(COALESCE(meta_json,'{}'), '$.synopsis', ?5)
@@ -670,7 +684,8 @@ fn upsert_item_with_roots(
                 author,
                 series,
                 synopsis.unwrap_or_default(),
-                id
+                id,
+                epub_title,
             ],
         );
         if let Err(error) = published { tracing::warn!(id,%error,"new item metadata held"); }

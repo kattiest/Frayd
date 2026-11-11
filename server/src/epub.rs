@@ -7,6 +7,7 @@ const XML_EVENT_LIMIT: usize = 100_000;
 const XML_DEPTH_LIMIT: usize = 128;
 const CONTAINER_NAMESPACE: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
 const OPF_NAMESPACE: &str = "http://www.idpf.org/2007/opf";
+const DC_NAMESPACE: &str = "http://purl.org/dc/elements/1.1/";
 
 #[derive(Debug, PartialEq)]
 enum ReadRejection { Io, TooLarge, InvalidXml }
@@ -57,6 +58,8 @@ fn xml_structure(
     let mut version=quick_xml::XmlVersion::Implicit1_0;
     let mut parents:Vec<XmlParent>=Vec::new();
     let mut roots=0usize;
+    // Dublin Core text capture: dc:creator / dc:title content accumulates here between Start and End.
+    let mut capture:Option<(&str,String)>=None;
     for _ in 0..XML_EVENT_LIMIT {
         let event=reader.read_event().map_err(|_|ReadRejection::InvalidXml)?;
         match event {
@@ -76,10 +79,12 @@ fn xml_structure(
                 {
                     return Err(ReadRejection::InvalidXml);
                 }
-                if parents.is_empty() || matches!(name,"rootfile"|"rootfiles"|"item"|"itemref"|"meta"|"manifest"|"spine"|"metadata") {
+                if parents.is_empty() || matches!(name,"rootfile"|"rootfiles"|"item"|"itemref"|"meta"|"manifest"|"spine"|"metadata"|"creator"|"title") {
+                    // Dublin Core elements (dc:creator, dc:title) live in their own namespace inside OPF metadata.
+                    let dc = matches!(name,"creator"|"title");
                     match resolved {
                         ResolveResult::Unbound => (),
-                        ResolveResult::Bound(value) if value.as_ref() == namespace => (),
+                        ResolveResult::Bound(value) if value.as_ref() == namespace || (dc && value.as_ref() == DC_NAMESPACE) => (),
                         _ => return Err(ReadRejection::InvalidXml),
                     }
                     let mut attributes=std::collections::HashMap::new();
@@ -98,15 +103,53 @@ fn xml_structure(
                     }
                     visit(name,&parents,unbound,&attributes);
                 }
+                if matches!(name,"creator"|"title") && parents.last().is_some_and(|p|p.name=="metadata") {
+                    capture = Some((if name=="creator" {"creator"} else {"title"}, String::new()));
+                }
                 if matches!(event,Event::Start(_)) {parents.push(XmlParent{name:name.to_string(),unbound});}
             }
             Event::Decl(declaration)=>{version=declaration.xml_version().map_err(|_|ReadRejection::InvalidXml)?;},
-            Event::End(_)=>{parents.pop().ok_or(ReadRejection::InvalidXml)?;}
+            Event::End(_)=>{
+                if let Some((kind,text))=capture.as_mut() {
+                    if parents.last().is_some_and(|p|p.name==*kind) {
+                        let value=text.trim().to_string();
+                        if !value.is_empty() {
+                            if *kind=="creator" {DC_CREATOR.with(|c|*c.borrow_mut()=Some(value));}
+                            else {DC_TITLE.with(|t|*t.borrow_mut()=Some(value));}
+                        }
+                        capture=None;
+                    }
+                }
+                parents.pop().ok_or(ReadRejection::InvalidXml)?;}
             Event::Eof=>return if parents.is_empty() && roots==1 {Ok(())}else{Err(ReadRejection::InvalidXml)},
+            Event::Text(text)=>{if let Some((_,buf))=capture.as_mut() {buf.push_str(&text.xml10_content());}},
+            Event::CData(text)=>{if let Some((_,buf))=capture.as_mut() {buf.push_str(&text.xml10_content());}},
+            Event::GeneralRef(reference)=>{
+                if let Some((_,buf))=capture.as_mut() {
+                    if let Ok(Some(character))=reference.resolve_char_ref() {buf.push(character);}
+                    else if let Some(entity)=quick_xml::escape::resolve_predefined_entity(reference.as_ref()) {buf.push_str(entity);}
+                }
+            }
             _=>(),
         }
     }
     Err(ReadRejection::TooLarge)
+}
+
+thread_local! {
+    static DC_CREATOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static DC_TITLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// OPF metadata (dc:creator, dc:title) as (author, title); None when the book declares neither.
+pub fn epub_metadata(path: &Path) -> Option<(Option<String>, Option<String>)> {
+    DC_CREATOR.with(|c|*c.borrow_mut()=None);
+    DC_TITLE.with(|t|*t.borrow_mut()=None);
+    let mut zip=crate::comic::open_zip(path)?;
+    let _=package(&mut zip);
+    let author=DC_CREATOR.with(|c|c.borrow().clone());
+    let title=DC_TITLE.with(|t|t.borrow().clone());
+    if author.is_none() && title.is_none() {None}else{Some((author,title))}
 }
 
 fn parent_context(parents:&[XmlParent],expected:&[&str])->bool {
@@ -114,7 +157,7 @@ fn parent_context(parents:&[XmlParent],expected:&[&str])->bool {
 }
 
 struct ManifestItem { id:String, href:String, properties:String, media_type:String }
-struct Package { path:String, manifest:Vec<ManifestItem>, spine:Vec<String>, cover_id:Option<String> }
+struct Package { path:String, manifest:Vec<ManifestItem>, spine:Vec<String>, cover_id:Option<String>, creator:Option<String>, title:Option<String> }
 
 fn package(zip: &mut zip::ZipArchive<std::fs::File>) -> EntryRead<Package> {
     let Some(container)=read_text(zip,"META-INF/container.xml")? else {return Ok(None);};
@@ -131,7 +174,7 @@ fn package(zip: &mut zip::ZipArchive<std::fs::File>) -> EntryRead<Package> {
     if matches!(parsed,Err(ReadRejection::InvalidXml)) {return Ok(None);}parsed?;
     let Some(path)=opf_path.and_then(|path|resolve_href("",&path)) else {return Ok(None);};
     let Some(opf)=read_text(zip,&path)? else {return Ok(None);};
-    let mut result=Package{path,manifest:Vec::new(),spine:Vec::new(),cover_id:None};
+    let mut result=Package{path,manifest:Vec::new(),spine:Vec::new(),cover_id:None,creator:None,title:None};
     let parsed=xml_structure(&opf,OPF_NAMESPACE,|name,parents,_,attributes| {
         match name {
             "item" if parent_context(parents, &["package", "manifest"]) => {
@@ -320,6 +363,8 @@ mod tests {
     fn package_spine_preserves_order_skips_missing_and_keeps_first_duplicate() {
         let item=|id:&str,href:&str|ManifestItem{id:id.into(),href:href.into(),properties:String::new(),media_type:String::new()};
         let package = Package {
+            creator: None,
+            title: None,
             path: "OPS/book.opf".into(),
             manifest: vec![
                 item("first", "first.xhtml"),
@@ -405,5 +450,28 @@ mod tests {
         assert_eq!(attr(s, "id").unwrap(), "c1");
         assert_eq!(attr(s, "href").unwrap(), "ch1.xhtml");
         assert_eq!(attr(s, "missing"), None);
+    }
+}
+
+#[cfg(test)]
+mod dc_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn opf_dc_metadata_extracts_creator_and_title() {
+        let dir=std::env::temp_dir().join(format!("frayd-dc-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let epub=dir.join("book.epub");
+        let options=zip::write::SimpleFileOptions::default();
+        let mut archive=zip::ZipWriter::new(std::fs::File::create(&epub).unwrap());
+        archive.start_file("META-INF/container.xml",options).unwrap();
+        archive.write_all(br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#).unwrap();
+        archive.start_file("book.opf",options).unwrap();
+        archive.write_all(br#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Air Awakens</dc:title><dc:creator>Elise Kova</dc:creator></metadata><manifest/><spine/></package>"#).unwrap();
+        archive.finish().unwrap();
+        let (author,title)=epub_metadata(&epub).expect("metadata present");
+        assert_eq!(author.as_deref(),Some("Elise Kova"));
+        assert_eq!(title.as_deref(),Some("Air Awakens"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
