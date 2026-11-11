@@ -194,6 +194,18 @@ fn publish_thumbnail(db: &Connection, path: &Path, kind: &str, meta: &std::fs::M
 
 /// Filename heuristics: "Author - Series 03 - Title" / "Author - Title" → (author, series).
 /// Series number stripped from series name.
+/// "Last, First" sort-style names display as "First Last"; other names pass through.
+fn display_author(name: &str) -> Option<String> {
+    let name = name.trim();
+    match name.split_once(", ") {
+        Some((last, first)) if !last.is_empty() && !first.is_empty()
+            && first.split_whitespace().all(|w| w.chars().next().is_some_and(|c| c.is_uppercase())) => {
+            Some(format!("{first} {last}"))
+        }
+        _ => (!name.is_empty()).then(|| name.to_string()),
+    }
+}
+
 fn filename_author_series(stem: &str) -> (Option<String>, Option<String>) {
     let parts: Vec<&str> = stem.splitn(3, " - ").map(str::trim).collect();
     match parts.as_slice() {
@@ -605,7 +617,7 @@ fn upsert_item_with_roots(
             } else {0};
             // Unchanged ebooks: refresh OPF metadata without a probe.
             if kind=="ebook" {
-                let (epub_author,epub_title)=crate::epub::epub_metadata(path).unwrap_or((None,None));
+                let (epub_author,epub_title)=crate::epub::epub_metadata(path).map(|(a,t)|(a.and_then(|a|display_author(&a)),t)).unwrap_or((None,None));
                 if epub_author.is_some() || epub_title.is_some() {
                     let n=tx.execute("UPDATE media SET author=COALESCE(?1,author), title=COALESCE(?2,title)
                         WHERE path=?3",rusqlite::params![epub_author,epub_title,path_str])?;
@@ -666,10 +678,10 @@ fn upsert_item_with_roots(
         // Episode tags win over show-name inference; audio retains its existing filename heuristics.
         // Ebooks: OPF dc:creator/dc:title are authoritative; filename heuristics only fill gaps.
         let (epub_author,epub_title)=if kind=="ebook" {
-            crate::epub::epub_metadata(path).unwrap_or((None,None))
+            crate::epub::epub_metadata(path).map(|(a,t)|(a.and_then(|a|display_author(&a)),t)).unwrap_or((None,None))
         } else {(None,None)};
         let (filename_author,filename_series)=filename_author_series(&title);
-        let author=epub_author.or(tag_author).or(filename_author);
+        let author=epub_author.or_else(|| tag_author.as_deref().and_then(display_author)).or(filename_author);
         let series=tag_series.or_else(|| if kind=="episode" {episode_series(path,roots)}else{filename_series});
         let published = db.execute(
             "UPDATE media SET duration_secs = ?1,
